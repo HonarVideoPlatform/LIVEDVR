@@ -1,19 +1,31 @@
+import base64
+import collections
+import hashlib
 import os
-from TaskBase import TaskBase
-import urllib2
 import re
+import subprocess
+import urllib2
+
 import m3u8
+from Iso639Wrapper import Iso639Wrapper
+
 from Config.config import get_config
-import hashlib, base64
+from Logger.LoggerDecorator import log_subprocess_output
+from TaskBase import TaskBase
+from datetime import datetime
+
 # todo add timeout, and use m3u8 insted of regex
+
+Flavor = collections.namedtuple('Flavor', 'url language')
 
 
 class ConcatenationTask(TaskBase):
-
     nginx_port = get_config('nginx_port')
     nginx_host = get_config('nginx_host')
     secret = get_config('token_key')
     token_url_template = nginx_host + ":" + nginx_port +"/dc-0/recording/hls/p/0/e/{0}/"
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    ts_to_mp4_convertor = os.path.join(cwd, '../bin/ts_to_mp4_convertor')
 
     def __init__(self, param, logger_info):
         TaskBase.__init__(self, param, logger_info)
@@ -22,7 +34,8 @@ class ConcatenationTask(TaskBase):
         self.stamp_full_path = os.path.join(self.recording_path, 'stamp')
         self.token_url = self.token_url_template.format(self.recorded_id)
         self.nginx_url = "http://" + self.token_url + "t/{0}"
-
+        self.flavor_pattern = 'index-s(?P<flavor>\d+)'
+        self.iso639_wrapper = Iso639Wrapper(logger_info)
 
     def tokenize_url(self, url):
 
@@ -35,23 +48,27 @@ class ConcatenationTask(TaskBase):
         encoded_hash = base64.urlsafe_b64encode(hash).rstrip('=')
         return encoded_hash
 
-    def find_source(self):
-        self.logger.debug("About to load master manifest from %s" ,self.url_master)
+    def extract_flavor_dict(self):
+        self.logger.debug("About to load master manifest from %s", self.url_master)
         m3u8_obj = m3u8.load(self.url_master)
-        flavor_list = {}
-        maxbandwidth = -1
-        for element in m3u8_obj.playlists:
-            flavor_list[element.stream_info.bandwidth] = element.absolute_uri
-            if element.stream_info.bandwidth > maxbandwidth:
-                maxbandwidth = element.stream_info.bandwidth
-                maxbandwidth_url = element.absolute_uri
-        if maxbandwidth is -1:
-            msg = "Failed to find source from flavor list %s" % (str(flavor_list))
-            raise ValueError(msg)
+        flavors_list = []
 
-        self.logger.info("Got Bandwidths url pairs %s, find the source with the bandwidth [%s] url: [%s]",
-                             str(flavor_list), maxbandwidth, maxbandwidth_url)
-        return maxbandwidth_url
+        for element in m3u8_obj.playlists:
+            flavors_list.append(Flavor(
+                url=element.absolute_uri,
+                language='und'
+            ))
+
+        for element in m3u8_obj.media:
+            language = element.language
+            # convert alpha_2 (iso639_1 format) to alpha_3 (iso639-3) check https://pypi.python.org/pypi/pycountry
+            if len(element.language) == 2:
+                language = self.iso639_wrapper.convert_language_to_iso639_3(unicode(language))
+            flavors_list.append(Flavor(
+                url=element.absolute_uri,
+                language=language
+            ))
+        return flavors_list
 
     def download_chunks_and_concat(self, chunks, output_full_path):
         try:
@@ -62,7 +79,8 @@ class ConcatenationTask(TaskBase):
                     chunks_url = os.path.join(self.url_base_entry, chunk)
                     try:
                         chunk_bytes = self.download_file(chunks_url)
-                        self.logger.debug("Successfully downloaded from url [%s], about to write it to [%s]", chunks_url, output_full_path)
+                        self.logger.debug("Successfully downloaded from url [%s], about to write it to [%s]",
+                                          chunks_url, output_full_path)
                         file_output.write(chunk_bytes)
                     except urllib2.HTTPError as e:
                         if e.code == 404:
@@ -91,18 +109,85 @@ class ConcatenationTask(TaskBase):
         matches = re.findall(regex, m3u8, re.MULTILINE)
         return matches
 
+    def get_flavor_id(self, url_postfix, single_flavor):
+        if single_flavor:
+            flavors_dirs = filter(os.path.isdir,
+                                  [os.path.join(self.recording_path, f) for f in os.listdir(self.recording_path)])
+            flavor_id = flavors_dirs[0].rsplit('/', 1)[-1]
+        else:
+            result = re.search(self.flavor_pattern, url_postfix)
+            if not result:
+                error = "Error running concat task, failed to parse flavor from url: [%s]", obj.url
+                self.logger.error(error)
+                raise ValueError(error)
+            flavor_id = result.group('flavor')
+
+        return flavor_id
+
     def run(self):
 
-        output_full_path = os.path.join(self.recording_path, self.output_filename)
-        if os.path.isfile(output_full_path):
-            self.logger.warn("file [%s] already exist", output_full_path)
-            return
+        command = self.ts_to_mp4_convertor + ' '
         token = self.tokenize_url(self.token_url)
         self.url_base_entry = self.nginx_url.format(token)
         self.url_master = os.path.join(self.url_base_entry, 'master.m3u8')
-        url_source_manifest = self.find_source()
-        playlist = self.download_file(url_source_manifest)
-        self.logger.debug("load recording manifest : \n %s ", playlist)
-        chunks = m3u8.loads(playlist).files
-        self.download_chunks_and_concat(chunks, output_full_path)
-        self.logger.info("Successfully concat %d files into %s", len(chunks), output_full_path)
+        flavors_list = self.extract_flavor_dict()
+        single_flavor = len(flavors_list) == 1
+
+        for obj in flavors_list:
+            url_postfix = obj.url.rsplit('/', 1)[1]
+            flavor_id = self.get_flavor_id(url_postfix, single_flavor)
+            ts_output_filename = self.get_output_filename(flavor_id)
+            output_full_path = os.path.join(self.recording_path, ts_output_filename)
+            mp4_full_path = output_full_path.replace('.ts', '.mp4')
+            command = command + ' ' + output_full_path + ' ' + mp4_full_path + ' ' + obj.language
+            if os.path.isfile(output_full_path):
+                self.logger.warn("file [%s] already exist", output_full_path)
+                continue
+            playlist = self.download_file(obj.url)
+            self.logger.debug("load recording manifest : \n %s ", playlist)
+            chunks = m3u8.loads(playlist).files
+            self.download_chunks_and_concat(chunks, output_full_path)
+            self.logger.info("Successfully concat %d files into %s", len(chunks), output_full_path)
+        self.convert_ts_to_mp4(command)
+
+    def convert_ts_to_mp4(self, command):
+
+        start_time = datetime.now()
+        exitcode = -1
+        status = 'succeeded'
+        # convert the each flavor concatenated ts file to single mp4
+        self.logger.debug('About to run TS -> MP4 conversion. Command: %s', command)
+
+        try:
+            process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            log_subprocess_output(process, "ffmpeg: ts->mp4", self.logger)
+
+            output, outerr = process.communicate()
+            exitcode = process.returncode
+
+            if exitcode is 0:
+                self.logger.info('Successfully finished TS -> MP4 conversion')
+            else:
+                status = 'failed'
+                error = 'Failed to convert TS -> MP4. Convertor process exit code {}, {}'.format(exitcode, outerr)
+                self.logger.error(error)
+
+                raise subprocess.CalledProcessError(exitcode, command)
+
+        except (OSError, subprocess.CalledProcessError) as e:
+            self.logger.fatal("Failed to convert TS -> MP4 {}".format(str(e)))
+            raise e
+        except Exception as e:
+            self.logger.fatal("Failed to convert TS -> MP4 {}".format(str(e)))
+            raise e
+
+        finally:
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            self.logger.info(
+                "Conversion of TS -> MP4, {}, exit code [{}], duration [{}] seconds".format(status, str(
+                    exitcode), str(int(duration))))
+
+    def get_output_filename(self, flavor):
+        return self.output_filename + '_f' + flavor + '_out.ts'
